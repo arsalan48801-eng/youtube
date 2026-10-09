@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ytpipe"
+version = "0.1.0"
+description = "Faceless-video pipeline: fetch a source video, transcribe, analyze, rewrite a script, generate assets, edit with ffmpeg, publish to YouTube."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13.7",
+    "yt-dlp>=2024.4.9",
+    "imageio-ffmpeg>=0.5.1",
+]
+
+[project.optional-dependencies]
+api = ["fastapi>=0.111", "uvicorn[standard]>=0.30", "python-multipart>=0.0.9"]
+whisper = ["faster-whisper>=1.0"]
+dev = ["pytest>=8.0", "ruff>=0.4", "fastapi>=0.111"]
+
+[project.scripts]
+ytpipe = "ytpipe.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests favour readable one-line fixtures over column limits.
+"tests/*" = ["E501", "B007", "SIM108", "E741"]
+# The dashboard is a single-file HTML/CSS/JS document embedded as a string literal;
+# reflowing it to satisfy a Python line limit would only make it harder to read.
+"src/ytpipe/api.py" = ["E501"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+# B008: typer Option defaults are function calls in signatures -- that is the idiom.
+# SIM905: "str.split() -> list literal" rewrites our stopword lists into one 900-word
+#          line, which is far harder to diff and review than the wrapped string.
+ignore = ["B008", "SIM905"]

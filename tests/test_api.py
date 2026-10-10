@@ -138,3 +138,24 @@ class TestFiles:
     def test_unknown_jobs_are_404(self, client):
         for route in ("", "/events", "/video", "/script"):
             assert client.get(f"/jobs/does-not-exist{route}").status_code == 404
+
+
+def test_transcript_only_is_accepted_and_persisted(client, local_source):
+    """The HTTP body must expose what the CLI exposes, or the two drift apart."""
+    r = client.post(
+        "/jobs",
+        json={
+            "source": str(local_source),
+            "topic": "cable failures",
+            "target_seconds": 10,
+            "wpm": 190,
+            "offline": True,
+            "transcript_only": True,
+            "until": "script",
+        },
+    )
+    assert r.status_code == 202, r.text
+    job = wait_for(client, r.json()["job_id"])
+    assert job["status"] == "done", job["error"]
+    assert job["transcript_only"] is True
+    assert job["stages"]["script"]["status"] == "done"

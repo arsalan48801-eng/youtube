@@ -78,6 +78,7 @@ video{width:200px;border-radius:10px;border:1px solid var(--line);background:#00
   <label>stop after<select name="until"><option value="">end (render)</option><option>transcribe</option><option>analyze</option><option>script</option><option>storyboard</option><option>generate</option></select></label>
   <label class="check"><input type="checkbox" name="offline"> offline (no fetch, no providers)</label>
   <label class="check"><input type="checkbox" name="draft"> draft render (half resolution)</label>
+  <label class="check"><input type="checkbox" name="transcript_only"> read the link only (no media download)</label>
   <button type="submit">Queue job</button>
   <div id="msg" class="meta"></div>
 </form>
@@ -90,8 +91,11 @@ let sel=null, opened=new Set();
 async function j(u,o){const r=await fetch(u,o);if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||('HTTP '+r.status));return r.json()}
 $('#f').onsubmit=async e=>{e.preventDefault();
   const fd=new FormData(e.target); const d={};
-  for(const [k,v] of fd.entries()){ if(k==='offline'||k==='draft'){continue} if(v!=='') d[k]=v }
+  for(const [k,v] of fd.entries()){ if(k==='offline'||k==='draft'||k==='transcript_only'){continue} if(v!=='') d[k]=v }
   d.offline=fd.get('offline')!==null;
+  // an unchecked box is absent from FormData and a checked one is the string "on", so
+  // booleans are read from the form by presence, never by value.
+  d.transcript_only=fd.get('transcript_only')!==null;
   if(fd.get('draft')) d.target_seconds=Math.min(+d.target_seconds||45,12);
   d.target_seconds=+d.target_seconds; d.wpm=+d.wpm;
   $('#msg').textContent='queuing…'; const btn=$('#f').querySelector('button'); btn.disabled=true;
@@ -174,6 +178,8 @@ class JobCreate(BaseModel):
     wpm: float = Field(152.0, ge=80.0, le=320.0)
     language: str | None = None
     offline: bool = False
+    #: Metadata + caption track only: no media download. Renders become card-driven.
+    transcript_only: bool = False
     publish: bool = False
     privacy: str = "private"
     captions: bool = True
@@ -209,6 +215,7 @@ def _summary(ctx: AppContext, job: Job) -> dict[str, Any]:
         "target_seconds": job.request.target_seconds,
         "offline": job.request.offline,
         "publish": job.request.publish,
+        "transcript_only": job.request.transcript_only,
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
         "running": job.id in ctx.running,

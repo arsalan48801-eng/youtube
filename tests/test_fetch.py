@@ -193,3 +193,54 @@ class TestTranscriptOnly:
         assert fake_ydl.last_download is True
         assert "1080" in fake_ydl.last_options["format"]
         assert source.has_media
+class TestLocalCaptionTrack:
+    """A local clip and its captions do not have to share a file name."""
+
+    def _run(self, settings, tmp_path, clip, **kwargs):
+        from ytpipe.models import PipelineArtifacts, StageName
+        from ytpipe.pipeline import StageContext
+        from ytpipe.stages import FetchStage
+        from ytpipe.state import JobStore
+
+        store = JobStore(tmp_path / "db.sqlite3")
+        job = store.create(JobRequest(source=str(clip), **kwargs), job_id="loc", workdir=tmp_path / "j")
+        ctx = StageContext(job=job, settings=settings, store=store, artifacts=PipelineArtifacts(), stage=StageName.FETCH)
+        return FetchStage().run(ctx)
+
+    def test_a_sibling_track_is_still_found_automatically(self, settings, tmp_path):
+        clip = tmp_path / "clip.mp4"
+        _make_clip(clip)
+        (tmp_path / "clip.vtt").write_text(VTT, encoding="utf-8")
+        source = self._run(settings, tmp_path, clip)
+        assert source.subtitle_path and source.subtitle_path.name == "clip.vtt"
+
+    def test_an_explicit_track_wins_over_the_sibling_search(self, settings, tmp_path):
+        clip = tmp_path / "clip.mp4"
+        _make_clip(clip)
+        (tmp_path / "clip.vtt").write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nwrong track\n", encoding="utf-8")
+        chosen = tmp_path / "captions-i-actually-have.srt"
+        chosen.write_text("1\n00:00:00,000 --> 00:00:02,000\nThe real one.\n", encoding="utf-8")
+        source = self._run(settings, tmp_path, clip, caption_track=chosen)
+        assert source.subtitle_path == chosen
+
+    def test_a_missing_or_wrong_kind_of_track_is_refused_by_name(self, settings, tmp_path):
+        clip = tmp_path / "clip.mp4"
+        _make_clip(clip)
+        with pytest.raises(FetchError) as exc:
+            self._run(settings, tmp_path, clip, caption_track=tmp_path / "nope.vtt")
+        assert "does not exist" in str(exc.value)
+        with pytest.raises(FetchError) as exc:
+            self._run(settings, tmp_path, clip, caption_track=clip)
+        assert "not a .vtt/.srt/.ass" in str(exc.value)
+
+
+def _make_clip(path: Path) -> Path:
+    """A real, tiny, probeable file: fetch reads its duration, so bytes must be valid."""
+    from ytpipe.ffmpeg import FFmpeg
+
+    FFmpeg().run(
+        ["-f", "lavfi", "-i", "testsrc2=size=192x108:rate=12:duration=2", "-c:v", "libx264",
+         "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", str(path)],
+        timeout=120,
+    )
+    return path

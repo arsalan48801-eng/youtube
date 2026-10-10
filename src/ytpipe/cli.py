@@ -62,6 +62,9 @@ def run(
     transition: str = typer.Option("dip", help="cut | dip | xfade"),
     captions: bool = typer.Option(True, help="Burn captions into the picture"),
     scale: float = typer.Option(1.0, "--scale", help="0.5 = half-res draft pass, ~4x faster"),
+    subs: Path | None = typer.Option(
+        None, "--subs", help="Caption track for a local clip (.vtt/.srt), any file name"
+    ),
     transcript_only: bool = typer.Option(
         False, "--transcript-only", help="Read the link: metadata + captions, no media download"
     ),
@@ -85,6 +88,7 @@ def run(
         target_seconds=target,
         wpm=wpm,
         language=language,
+        caption_track=subs,
         transcript_only=transcript_only,
         music_path=music,
         transition=transition,

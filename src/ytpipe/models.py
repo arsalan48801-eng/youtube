@@ -378,6 +378,9 @@ class JobRequest(_Model):
     only: list[StageName] | None = None
     until: StageName | None = None
     resume: bool = False
+    #: Explicit caption track for a local source, so the file name does not have to match
+    #: the clip's. Ignored for a YouTube URL, which already knows its own tracks.
+    caption_track: Path | None = None
     #: Read the link instead of downloading it: metadata + caption track only. The edit
     #: then has no source footage to reuse, so visuals fall back to cards and stills.
     transcript_only: bool = False

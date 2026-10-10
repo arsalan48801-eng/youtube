@@ -15,6 +15,7 @@ want when a run is half-finished on a remote box.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -22,11 +23,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings, build_settings
+from .ffmpeg import FFmpeg
 from .models import Aspect, Job, JobRequest, StageName, Status
 from .pipeline import Pipeline
 from .state import JobStore
@@ -65,7 +67,9 @@ video{width:200px;border-radius:10px;border:1px solid var(--line);background:#00
 <header><h1>ytpipe <span>· fetch → script → cut → publish</span></h1><div id="health" class="meta"></div></header>
 <main>
 <form id="f">
-  <label>source<input name="source" placeholder="https://youtu.be/…  or /path/to/clip.mp4" required></label>
+  <label>source<input name="source" placeholder="https://youtu.be/…  or /path/to/clip.mp4"></label>
+  <label>or upload a clip<input type="file" name="clip" id="clip" accept="video/*">
+   <span class="meta">+ captions<input type="file" name="subs" id="subs" accept=".vtt,.srt"></span></label>
   <label>topic<input name="topic" placeholder="what the new video argues"></label>
   <div class="row">
     <label>aspect<select name="aspect"><option value="9:16">9:16</option><option value="16:9">16:9</option><option value="1:1">1:1</option></select></label>
@@ -89,15 +93,32 @@ const $=s=>document.querySelector(s);
 const esc=t=>String(t??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 let sel=null, opened=new Set();
 async function j(u,o){const r=await fetch(u,o);if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||('HTTP '+r.status));return r.json()}
+const clip=$('#clip'), subs=$('#subs');
 $('#f').onsubmit=async e=>{e.preventDefault();
-  const fd=new FormData(e.target); const d={};
-  for(const [k,v] of fd.entries()){ if(k==='offline'||k==='draft'||k==='transcript_only'){continue} if(v!=='') d[k]=v }
+  const btn0=$('#f').querySelector('button'); const fd=new FormData(e.target); const d={};
+  for(const [k,v] of fd.entries()){ if(k==='offline'||k==='draft'||k==='transcript_only'||k==='clip'||k==='subs'){continue} if(v!=='') d[k]=v }
   d.offline=fd.get('offline')!==null;
   // an unchecked box is absent from FormData and a checked one is the string "on", so
   // booleans are read from the form by presence, never by value.
   d.transcript_only=fd.get('transcript_only')!==null;
   if(fd.get('draft')) d.target_seconds=Math.min(+d.target_seconds||45,12);
   d.target_seconds=+d.target_seconds; d.wpm=+d.wpm;
+  try{
+    if(clip.files.length){
+      $('#msg').textContent='uploading '+clip.files[0].name+'…';
+      const up=new FormData(); up.append('file', clip.files[0]);
+      if(subs.files.length) up.append('subs', subs.files[0]);
+      const u=await j('/upload',{method:'POST',body:up});
+      d.source=u.path;
+      if(u.caption_track) d.caption_track=u.caption_track;
+      // If the clip is wider than tall, or the length box is still on its default, the
+      // source itself is the better guess than the form's.
+      if(d.aspect==='9:16' && u.aspect!=='9:16') d.aspect=u.aspect;
+      if(+d.target_seconds===45 && u.duration_s) d.target_seconds=Math.min(600,Math.max(8,Math.round(u.duration_s)));
+      $('#msg').textContent='uploaded '+u.name+' ('+(u.bytes/1e6).toFixed(1)+' MB, '+u.duration_s+'s)';
+    }
+  }catch(err){$('#msg').textContent='upload failed: '+err.message; btn0.disabled=false; return}
+  if(!d.source){$('#msg').textContent='need a clip to upload, or a source path/url'; return}
   $('#msg').textContent='queuing…'; const btn=$('#f').querySelector('button'); btn.disabled=true;
   try{const r=await j('/jobs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(d)});
     sel=r.job_id; $('#msg').textContent='queued '+r.job_id; refresh();}
@@ -169,6 +190,66 @@ class AppContext:
             self.running.discard(job_id)
 
 
+#: What `POST /upload` accepts. The clip types are what a browser can play back and
+#: ffmpeg can cut; captions are the three formats anyone actually exports.
+VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
+CAPTION_SUFFIXES = {".vtt", ".srt", ".ass", ".sub"}
+_CHUNK = 1 << 20
+
+
+def _safe_name(filename: str | None) -> str:
+    """Take a client file name down to something safe to put on a path.
+
+    ``Path(...).name`` drops any directory the client sent (including ``..`` segments),
+    then everything outside a boring alphabet is collapsed to a dash, so a browser that
+    reports ``C:\\Users\\x\\clip (1).mp4`` still produces a readable name.
+    """
+    name = Path(filename or "upload").name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")
+    return name[:80] or "upload"
+
+
+def _store_upload(file: UploadFile, root: Path, limit_bytes: int, allowed: set[str], label: str) -> Path:
+    """Stream one upload to disk, content-addressed, refusing oversized or wrong types."""
+    name = _safe_name(file.filename)
+    suffix = Path(name).suffix.lower()
+    if suffix not in allowed:
+        raise HTTPException(
+            status_code=415,
+            detail=f"{label} '{suffix or name}' is not one of {', '.join(sorted(allowed))}",
+        )
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = root / f".{name}.{file.size or 0}.part"
+    digest = hashlib.sha1()
+    written = 0
+    try:
+        with tmp.open("wb") as fh:
+            while chunk := file.file.read(_CHUNK):
+                written += len(chunk)
+                if written > limit_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"{label} is over the {limit_bytes / 1e6:.0f} MB limit "
+                        f"(set YTPIPE_UPLOAD_MAX_MB)",
+                    )
+                digest.update(chunk)
+                fh.write(chunk)
+        if written == 0:
+            raise HTTPException(status_code=422, detail=f"{label} was empty")
+        # Content-first, name-second: the same bytes under a different file name reuse
+        # the stored file instead of eating the disk again, so re-uploading a clip you
+        # already sent costs nothing and still points at the same path.
+        prefix = digest.hexdigest()[:12]
+        existing = sorted(root.glob(f"{prefix}-*"))
+        if existing:
+            tmp.unlink(missing_ok=True)
+            return existing[0]
+        target = root / f"{prefix}-{name}"
+        tmp.replace(target)
+        return target
+    finally:
+        tmp.unlink(missing_ok=True)
+
 class JobCreate(BaseModel):
     source: str = Field(..., description="YouTube URL, 11-char id, or a path readable by the server")
     topic: str | None = None
@@ -177,6 +258,7 @@ class JobCreate(BaseModel):
     target_seconds: float = Field(45.0, ge=8.0, le=600.0)
     wpm: float = Field(152.0, ge=80.0, le=320.0)
     language: str | None = None
+    caption_track: Path | None = Field(None, description="Caption file for a local clip")
     offline: bool = False
     #: Metadata + caption track only: no media download. Renders become card-driven.
     transcript_only: bool = False
@@ -330,6 +412,49 @@ def create_app(settings: Settings | None = None, *, max_workers: int = 2) -> Fas
             "workers": ctx.max_workers,
             "running": sorted(ctx.running),
             "workdir": str(settings_.workdir.resolve()),
+        }
+
+    @app.post("/upload")
+    def upload_clip(
+        file: UploadFile = File(..., description="The source clip, already downloaded"),
+        subs: UploadFile | None = File(None, description="Optional caption track (.vtt/.srt)"),
+    ) -> dict[str, Any]:
+        """Store a clip you already have, so a job can start from it instead of a fetch.
+
+        Content-addressed under ``<workdir>/uploads``: re-uploading the same bytes costs
+        one write, and the path is stable, so `--only edit` style reruns can point at it
+        forever. The file is probed here, at upload time, because "is this a video?" is
+        much cheaper to answer now than after a queue.
+        """
+        settings_ = ctx.pipeline.settings
+        # A 50 KB floor: setting the limit to 0 must not read as "accept nothing".
+        limit = max(0.05, float(settings_.upload_max_mb)) * 1_000_000
+        media = _store_upload(file, settings_.uploads_dir, limit, VIDEO_SUFFIXES, "clip")
+        track = None
+        if subs is not None and subs.filename:
+            track = _store_upload(subs, settings_.uploads_dir, 16 * 1_000_000, CAPTION_SUFFIXES, "captions")
+        try:
+            info = FFmpeg(settings_.ffmpeg_binary).probe(media)
+        except Exception as exc:
+            media.unlink(missing_ok=True)
+            raise HTTPException(status_code=415, detail=f"{media.name} is not a readable video: {exc}") from exc
+        if not info.duration:
+            media.unlink(missing_ok=True)
+            raise HTTPException(status_code=415, detail=f"{media.name} has no readable video stream")
+        width, height = int(info.width or 0), int(info.height or 0)
+        aspect = "16:9" if width > height else ("1:1" if width == height else "9:16")
+        return {
+            "path": str(media),
+            "name": media.name,
+            "bytes": media.stat().st_size,
+            "duration_s": round(float(info.duration), 3),
+            "width": width,
+            "height": height,
+            "aspect": aspect,
+            "has_audio": bool(info.has_audio),
+            "caption_track": str(track) if track else None,
+            # The exact body to send next, so a client can forward it to POST /jobs as-is.
+            "job": {"source": str(media), "caption_track": str(track) if track else None, "aspect": aspect},
         }
 
     @app.post("/jobs", status_code=202)

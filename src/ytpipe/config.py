@@ -116,6 +116,15 @@ class Settings(BaseSettings):
     def jobs_dir(self) -> Path:
         return self.workdir / "jobs"
 
+    #: Ceiling for `POST /upload`, in megabytes. Shorts are single-digit MB; the limit is
+    #: here so a mistake (or a hostile client) cannot fill the disk.
+    upload_max_mb: float = 512.0
+
+    @property
+    def uploads_dir(self) -> Path:
+        """Where client-uploaded source clips land, outside any job folder."""
+        return self.workdir / "uploads"
+
     def job_dir(self, job_id: str) -> Path:
         return self.jobs_dir / job_id
 
@@ -125,6 +134,7 @@ class Settings(BaseSettings):
     def ensure_dirs(self) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.uploads_dir.mkdir(parents=True, exist_ok=True)
 
     # -- providers -----------------------------------------------------------
 

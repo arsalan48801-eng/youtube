@@ -159,3 +159,95 @@ def test_transcript_only_is_accepted_and_persisted(client, local_source):
     assert job["status"] == "done", job["error"]
     assert job["transcript_only"] is True
     assert job["stages"]["script"]["status"] == "done"
+
+class TestUpload:
+    """`POST /upload` is how a clip you already have enters the pipeline."""
+
+    def test_a_real_clip_is_stored_probed_and_usable_as_a_source(self, client, local_source):
+        resp = client.post(
+            "/upload",
+            files={"file": ("my clip (1).mp4", local_source.read_bytes(), "video/mp4")},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert 10.0 < body["duration_s"] < 26.0, "the probe result must come back to the client"
+        assert body["aspect"] in ("9:16", "16:9", "1:1")
+        assert body["path"].endswith(".mp4") and Path(body["path"]).exists()
+        assert "my-clip-1" in Path(body["path"]).name.replace(".mp4", ""), "client names are cleaned"
+        assert body["caption_track"] is None
+
+        job = client.post(
+            "/jobs",
+            json={
+                "source": body["path"], "offline": True, "topic": "cable failures",
+                "target_seconds": 10, "wpm": 190, "until": "storyboard",
+            },
+        )
+        assert job.status_code == 202
+        done = wait_for(client, job.json()["job_id"])
+        assert done["status"] == "done", done["error"]
+        assert done["stages"]["storyboard"]["status"] == "done"
+        assert done["stages"]["fetch"]["status"] == "done", "a local clip still runs fetch (to probe)"
+
+    def test_uploads_are_content_addressed_so_the_same_bytes_are_one_file(self, client, local_source):
+        data = local_source.read_bytes()
+        first = client.post("/upload", files={"file": ("a.mp4", data, "video/mp4")}).json()["path"]
+        second = client.post("/upload", files={"file": ("b.mp4", data, "video/mp4")}).json()["path"]
+        assert Path(first).name.split("-", 1)[0] == Path(second).name.split("-", 1)[0]
+        assert len(list(Path(first).parent.glob("*.mp4"))) == 1
+
+    def test_captions_come_along_and_reach_the_transcript(self, client, local_source):
+        vtt = local_source.with_suffix(".vtt").read_bytes()
+        resp = client.post(
+            "/upload",
+            files={
+                "file": ("clip.mp4", local_source.read_bytes(), "video/mp4"),
+                "subs": ("whatever-i-named-it.srt", vtt.replace(b"WEBVTT", b""), "text/plain"),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["caption_track"] and Path(body["caption_track"]).exists()
+        job = client.post(
+            "/jobs",
+            json={
+                "source": body["path"], "caption_track": body["caption_track"], "offline": True,
+                "topic": "cable failures", "target_seconds": 10, "wpm": 190, "until": "transcribe",
+            },
+        )
+        done = wait_for(client, job.json()["job_id"])
+        assert done["status"] == "done", done["error"]
+        assert done["stages"]["transcribe"]["status"] == "done"
+
+    def test_a_file_that_is_not_a_video_is_rejected_with_an_actionable_detail(self, client, settings):
+        resp = client.post("/upload", files={"file": ("notes.txt", b"hello", "text/plain")})
+        assert resp.status_code == 415
+        assert ".mp4" in resp.json()["detail"]
+
+        # .mp4 on the outside, garbage on the inside: the probe is what catches this.
+        resp = client.post("/upload", files={"file": ("fake.mp4", b"not a video at all", "video/mp4")})
+        assert resp.status_code == 415
+        assert "readable video" in resp.json()["detail"] or "no readable video stream" in resp.json()["detail"]
+        assert not list(settings.uploads_dir.glob("*fake.mp4")), "rejected uploads are removed"
+
+    def test_oversized_uploads_are_cut_off_at_the_limit(self, client, settings, local_source):
+        # The app holds the same Settings object, so this is the documented env knob
+        # (YTPIPE_UPLOAD_MAX_MB) exercised at runtime rather than a test-only hook.
+        settings.upload_max_mb = 0.05
+        size = len(local_source.read_bytes())
+        resp = client.post("/upload", files={"file": ("big.mp4", local_source.read_bytes(), "video/mp4")})
+        assert resp.status_code == 413, resp.text
+        assert "MB limit" in resp.json()["detail"]
+        assert size > 50_000, "the fixture has to be bigger than the limit for this to mean anything"
+        assert not list(settings.uploads_dir.glob("*.part")), "a rejected upload leaves no partial file"
+        assert not list(settings.uploads_dir.glob("*.mp4"))
+
+    def test_a_client_cannot_escape_the_upload_directory_with_a_name(self, client, settings, local_source):
+        resp = client.post(
+            "/upload",
+            files={"file": ("../../../../etc/passwd.mp4", local_source.read_bytes(), "video/mp4")},
+        )
+        assert resp.status_code == 200
+        stored = Path(resp.json()["path"])
+        assert stored.parent == settings.uploads_dir
+        assert stored.name == Path(stored.name).name and ".." not in stored.name

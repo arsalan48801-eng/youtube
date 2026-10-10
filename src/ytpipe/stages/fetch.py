@@ -102,8 +102,18 @@ class FetchStage:
                 import shutil
 
                 shutil.copy2(path, media)
-        # A sibling .vtt/.srt next to the media is treated as its caption track, so
-        # local runs get the same transcript path as a YouTube download.
+        # An explicit --subs wins; otherwise a sibling .vtt/.srt next to the media is
+        # treated as its caption track, so local runs get the same transcript path a
+        # YouTube download would have produced.
+        requested = ctx.job.request.caption_track
+        if requested:
+            subs = Path(requested).expanduser()
+            if not subs.exists():
+                raise FetchError(f"caption track {subs} does not exist")
+            if subs.suffix.lower() not in (".vtt", ".srt", ".ass", ".sub"):
+                raise FetchError(f"{subs.name} is not a .vtt/.srt/.ass caption file")
+            ctx.emit(f"caption track: {subs.name} (as given)")
+            return self._local_source(ctx, path, media, info, subs)
         subs = None
         for suffix in (".en-orig.vtt", ".vtt", ".srt", ".ass"):
             candidate = path.with_suffix(suffix)
@@ -112,6 +122,10 @@ class FetchStage:
                 break
         if subs:
             ctx.emit(f"local caption track: {subs.name}")
+        return self._local_source(ctx, path, media, info, subs)
+
+    @staticmethod
+    def _local_source(ctx: Any, path: Path, media: Path, info: Any, subs: Path | None) -> SourceVideo:
         return SourceVideo(
             video_id=path.stem,
             url=None,

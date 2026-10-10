@@ -19,6 +19,9 @@ python -m venv .venv && . .venv/bin/activate
 pip install -e ".[api,dev]"
 
 ytpipe doctor                     # which providers, fonts, filters and keys are live
+
+# or start from a clip you already downloaded -- no fetch, no network, captions optional
+ytpipe run /path/to/clip.mp4 --subs /path/to/captions.srt --topic "your angle" --target 30
 ytpipe demo                         # local 18s clip + word-timed captions, no download
 ytpipe run fixtures/demo.mp4 --offline --target 22 --scale 0.25 \
     --topic "how to buy a monitor"
@@ -44,6 +47,44 @@ Per-job layout (`work/jobs/<id>/`): `job.json`, `stages/<stage>/*.json`, `cache/
 
 The CLI hides the stages that cannot run — no `transcribe` when there is no audio track
 and no local ASR, no `fetch` for a local file, no `publish` unless you asked for it.
+
+### Starting from a file you already have
+
+If you supply the clip, nothing is fetched:
+
+```bash
+ytpipe run /path/to/clip.mp4                        # a sibling clip.vtt / .srt is picked up
+ytpipe run /path/to/clip.mp4 --subs my-names.srt     # ...or point at any caption file
+ytpipe run /path/to/clip.mp4 --subs subs.srt --music bed.mp3 --until script
+```
+
+`fetch` still runs — it is three lines of probing (duration, size, codecs) rather than a
+download — and `caption_track` is what lets the captions have their own name instead of
+having to match the clip's. With no caption track and no local ASR, `transcribe` returns an
+empty transcript and the writer builds the script from the topic and the source's own
+metadata: a weaker script, but a complete render.
+
+The HTTP surface has the same entry point, so it works from the browser:
+
+```bash
+curl -F "file=@clip.mp4" -F "subs=@clip.vtt" localhost:8000/upload
+# -> {"path": ".../uploads/2c4350771eca-clip.mp4", "duration_s": 18.0, "aspect": "9:16",
+#     "caption_track": ".../uploads/...-clip.vtt", "job": {"source": "...", ...}}
+curl -X POST localhost:8000/jobs -H 'content-type: application/json' \
+     -d '{"source": "<path from /upload>", "offline": true, "topic": "..."}'
+```
+
+Uploads land in `<workdir>/uploads`, named `<sha1[:12]>-<sanitized name>`: content-first,
+so re-uploading identical bytes under a different name reuses the stored file instead of
+eating the disk, and the path is stable enough to point `--only edit` at repeatedly. The
+name is taken with `Path(name).name` and a strict character class, because a browser can
+send `C:\Users\x\clip.mp4` or `../../etc/passwd.mp4` and neither belongs in a path. The
+file is probed at upload time — `415` for a container ffmpeg cannot open is a much better
+answer than a job that fails four stages later — and `413` past `YTPIPE_UPLOAD_MAX_MB`
+(512 by default) with no partial file left behind. The dashboard has the same flow as a
+file picker: choosing a clip uploads it, then the returned path, duration and aspect fill
+the form (the canvas follows the clip when a horizontal one was sent and the length box is
+still on its default).
 
 ### Reading a link without downloading it
 
@@ -184,6 +225,7 @@ ytpipe api --host 0.0.0.0 --port 8000      # dashboard at /, docs at /docs
 ```
 
 ```
+POST /upload                    store a clip (+ optional captions) and get back a path to queue
 POST /jobs                      start a pipeline (accepts the same fields as JobRequest)
 GET  /jobs?limit=20             recent jobs
 GET  /jobs/{id}                 status + per-stage timings
@@ -281,7 +323,7 @@ try/except around every call site.
 
 ## Tests
 
-136 tests, no network, no API keys:
+146 tests, no network, no API keys:
 
 ```bash
 pytest -q                    # unit tests, including real ffmpeg renders
@@ -338,6 +380,9 @@ Stated plainly, because they are the parts that decide whether this is a toy or 
   Default behaviour is to reuse *your* source; `assets.json` records every reused span.
 * `--only publish` on a job that never rendered is rejected with a message naming the
   missing stage, not a stack trace.
+* `POST /upload` writes inside `<workdir>/uploads` and nowhere else. It is not an auth
+  boundary: if the port is reachable, anyone on it can spend your disk up to
+  `YTPIPE_UPLOAD_MAX_MB`, so put a real auth proxy in front before exposing it.
 * YouTube is sometimes unreachable (datacenter IPs, age gates, this sandbox). `fetch`
   reports that as one line pointing at `--source /path/to/clip.mp4` rather than relaying
   yt-dlp's issue-tracker boilerplate — but it cannot work around a block, so the fetch

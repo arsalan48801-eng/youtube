@@ -264,13 +264,16 @@ try/except around every call site.
 
 ## Tests
 
-124 tests, no network, no API keys:
+132 tests, no network, no API keys:
 
 ```bash
 pytest -q                    # unit tests, including real ffmpeg renders
 ```
 
-* `test_media.py` — ffmpeg probing, tone/silence encoding, ASS escaping and cue packing.
+* `test_media.py` — ffmpeg probing, tone/silence encoding, ASS escaping and cue packing,
+  and `ytpipe demo` producing a clip the rest of the pipeline can actually use.
+* `test_fetch.py` — how a `--source` string is classified (URL, bare id, local file, junk)
+  and what each failure tells you. No network: yt-dlp is never invoked.
 * `test_writing.py` — the offline writer, the regexes that clean up ASR output, the
   `Brief` heuristics (pace, hook style, readability, B-roll windows), storyboard chunk
   selection, and `on_screen_for`.
@@ -317,3 +320,7 @@ Stated plainly, because they are the parts that decide whether this is a toy or 
   Default behaviour is to reuse *your* source; `assets.json` records every reused span.
 * `--only publish` on a job that never rendered is rejected with a message naming the
   missing stage, not a stack trace.
+* YouTube is sometimes unreachable (datacenter IPs, age gates, this sandbox). `fetch`
+  reports that as one line pointing at `--source /path/to/clip.mp4` rather than relaying
+  yt-dlp's issue-tracker boilerplate — but it cannot work around a block, so the fetch
+  step has to run somewhere with access.

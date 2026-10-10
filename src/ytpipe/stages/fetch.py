@@ -15,6 +15,44 @@ from typing import Any
 from ..errors import FetchError
 from ..models import SourceVideo, StageName
 
+#: yt-dlp writes stack-trace-shaped errors aimed at its own issue tracker. A pipeline
+#: user needs the opposite: one line, plus what to do next when the cause is a blocked
+#: network rather than a bad URL.
+_NETWORK_MARKERS = (
+    "tls/ssl",
+    "unable to download api page",
+    "unable to connect",
+    "urlopen error",
+    "timed out",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "http error 5",
+)
+
+
+def explain_failure(text: str) -> str:
+    """Shorten a yt-dlp failure into something actionable."""
+    noise = ("please report this issue", "filling out the appropriate", "confirm you are on the latest")
+    kept: list[str] = []
+    for line in text.splitlines():
+        cut = len(line)
+        for marker in noise:
+            cut = min(cut, line.lower().find(marker) if marker in line.lower() else cut)
+        line = line[:cut].strip(" ;,.")
+        if line:
+            kept.append(line)
+    first = " ".join(kept)[:220].rstrip(" ;,.") or "yt-dlp failed"
+    low = first.lower()
+    if any(m in low for m in _NETWORK_MARKERS):
+        return (
+            f"{first}. YouTube looks unreachable from this machine -- run the fetch where "
+            f"you have access, or pass a file you downloaded: ytpipe run /path/to/clip.mp4"
+        )
+    gated = ("private video", "sign in to confirm", "members-only", "not available in your country")
+    if any(m in low for m in gated):
+        return f"{first}. This video cannot be fetched anonymously; use a local file as --source."
+    return first
+
 _URL_RE = re.compile(r"^https?://", re.I)
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -130,7 +168,7 @@ class FetchStage:
             with yt_dlp.YoutubeDL(self._ydl_options(ctx)) as ydl:
                 info = ydl.extract_info(url, download=True)
         except Exception as exc:
-            raise FetchError(f"yt-dlp failed: {exc}") from exc
+            raise FetchError(explain_failure(str(exc) or repr(exc))) from exc
         if not info:
             raise FetchError("yt-dlp returned no metadata")
         if info.get("_type") == "playlist":  # pragma: no cover - noplaylist guards this

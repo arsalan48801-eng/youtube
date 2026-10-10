@@ -45,6 +45,23 @@ Per-job layout (`work/jobs/<id>/`): `job.json`, `stages/<stage>/*.json`, `cache/
 The CLI hides the stages that cannot run — no `transcribe` when there is no audio track
 and no local ASR, no `fetch` for a local file, no `publish` unless you asked for it.
 
+### Reading a link without downloading it
+
+```bash
+ytpipe transcript "https://youtube.com/shorts/CRGWDiIgMZ4"        # sentences + timings
+ytpipe transcript "$URL" --srt src.srt --json src.json             # save both
+ytpipe transcript "$URL" --raw                                      # one line per caption cue
+```
+
+Only the metadata page and the caption track are fetched — tens of kilobytes, and the
+streaming URLs are never touched, which is the part a bot-check or a blocked host kills.
+It is the cheapest way to answer "is there anything in this video worth working with?"
+before you commit to a render. The same mode exists for a full job as
+`run --transcript-only`: no media means no source footage to cut, so visuals fall back to
+cards and stills — still a finished video, just a fresh one rather than a repurposed one.
+A video with no caption track cannot be read this way, and `fetch` says exactly that
+rather than quietly starting a download you did not ask for.
+
 `ytpipe run --help` lists everything. Two flags do most of the day-to-day work:
 `--only edit,publish` re-runs a subset from cached artifacts, and `--job-id <id>` pins the
 folder so a rerun reuses them. That is the re-render loop — change the caption style or the
@@ -264,7 +281,7 @@ try/except around every call site.
 
 ## Tests
 
-132 tests, no network, no API keys:
+136 tests, no network, no API keys:
 
 ```bash
 pytest -q                    # unit tests, including real ffmpeg renders
@@ -272,8 +289,9 @@ pytest -q                    # unit tests, including real ffmpeg renders
 
 * `test_media.py` — ffmpeg probing, tone/silence encoding, ASS escaping and cue packing,
   and `ytpipe demo` producing a clip the rest of the pipeline can actually use.
-* `test_fetch.py` — how a `--source` string is classified (URL, bare id, local file, junk)
-  and what each failure tells you. No network: yt-dlp is never invoked.
+* `test_fetch.py` — how a `--source` string is classified (URL, bare id, local file, junk),
+  what each failure tells you, and that `--transcript-only` asks yt-dlp for captions and
+  nothing else. No network: `yt_dlp` is replaced by a fake that records its options.
 * `test_writing.py` — the offline writer, the regexes that clean up ASR output, the
   `Brief` heuristics (pace, hook style, readability, B-roll windows), storyboard chunk
   selection, and `on_screen_for`.

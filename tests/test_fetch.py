@@ -6,9 +6,15 @@ directly -- the network itself is never touched.
 
 from __future__ import annotations
 
+import logging
+import sys
+import types
+from pathlib import Path
+
 import pytest
 
 from ytpipe.errors import FetchError
+from ytpipe.models import JobRequest
 from ytpipe.stages.fetch import explain_failure, resolve_source
 
 
@@ -75,3 +81,115 @@ class TestExplainFailure:
 
     def test_empty_input_still_produces_a_message(self):
         assert explain_failure("") == "yt-dlp failed"
+
+
+VTT = """WEBVTT
+
+00:00:00.000 --> 00:00:03.000
+The spec sheet hides one number that matters.
+
+00:00:03.000 --> 00:00:06.000
+We measured four panels for thirty days.
+"""
+
+
+class _FakeDL:
+    """Stands in for yt_dlp.YoutubeDL: records the options, drops a caption file."""
+
+    last_options: dict = {}
+    last_download: bool | None = None
+    captions = True
+
+    def __init__(self, options):
+        _FakeDL.last_options = options
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def extract_info(self, url, download=True):
+        _FakeDL.last_download = download
+        out = Path(_FakeDL.last_options["outtmpl"]).parent
+        if type(self).captions:
+            (out / "source.en.vtt").write_text(VTT, encoding="utf-8")
+            (out / "source.en.vtt.info.json").write_text("{}", encoding="utf-8")
+        if download:
+            media = out / "source.mp4"
+            media.write_bytes(b"ftyp" * 64)
+            self.requested = str(media)
+        return {
+            "id": "CRGWDiIgMZ4",
+            "title": "The monitor spec nobody checks",
+            "duration": 31.0,
+            "uploader": "Panel Test",
+            "webpage_url": "https://www.youtube.com/watch?v=CRGWDiIgMZ4",
+            "requested_downloads": [{"filepath": getattr(self, "requested", "")}],
+        }
+
+
+@pytest.fixture
+def fake_ydl(monkeypatch):
+    """Install the fake as the `yt_dlp` module the stage imports inside its function."""
+    module = types.ModuleType("yt_dlp")
+    module.YoutubeDL = _FakeDL
+    monkeypatch.setitem(sys.modules, "yt_dlp", module)
+    _FakeDL.captions = True
+    return _FakeDL
+
+
+def _fetch(settings, tmp_path, **request_kwargs):
+    from ytpipe.models import PipelineArtifacts, StageName
+    from ytpipe.pipeline import StageContext
+    from ytpipe.stages import FetchStage
+    from ytpipe.state import JobStore
+
+    settings.offline = False
+    store = JobStore(tmp_path / "db.sqlite3")
+    job = store.create(
+        JobRequest(source="https://youtube.com/shorts/CRGWDiIgMZ4?si=qDhfATJ2BcsFGGwF", **request_kwargs),
+        job_id="ydl",
+        workdir=tmp_path / "job",
+    )
+    ctx = StageContext(job=job, settings=settings, store=store, artifacts=PipelineArtifacts(), stage=StageName.FETCH)
+    return FetchStage().run(ctx), ctx
+
+
+class TestTranscriptOnly:
+    """`--transcript-only` reads the link instead of downloading it."""
+
+    def test_no_media_is_requested_and_the_track_is_picked_up(
+        self, settings, tmp_path, fake_ydl, caplog
+    ):
+        caplog.set_level(logging.INFO, logger="ytpipe")
+        source, _ = _fetch(settings, tmp_path, transcript_only=True)
+        assert fake_ydl.last_download is False, "extract_info must be called with download=False"
+        assert fake_ydl.last_options.get("skip_download") is True
+        assert "format" not in fake_ydl.last_options, "no stream selection when nothing is downloaded"
+        assert not fake_ydl.last_options.get("writethumbnail")
+        assert source.media_path is None and not source.has_media
+        assert source.duration == 31.0 and source.channel == "Panel Test"
+        assert source.subtitle_path and source.subtitle_path.exists()
+        assert "no download" in caplog.text, "the log must say nothing was fetched"
+
+    def test_the_empty_download_leaves_the_rest_of_the_pipeline_card_only(self, settings, tmp_path, fake_ydl):
+        source, _ = _fetch(settings, tmp_path, transcript_only=True)
+        from ytpipe.stages.storyboard import StoryboardStage
+
+        assert StoryboardStage._source_candidates(source, None) == []
+
+    def test_a_video_without_captions_says_so_and_points_at_the_way_in(
+        self, settings, tmp_path, fake_ydl
+    ):
+        fake_ydl.captions = False
+        with pytest.raises(FetchError) as exc:
+            _fetch(settings, tmp_path, transcript_only=True)
+        msg = str(exc.value)
+        assert "no caption track" in msg and "--transcript-only" in msg
+
+    def test_a_normal_fetch_still_downloads_the_media(self, settings, tmp_path, fake_ydl):
+        source, _ = _fetch(settings, tmp_path)
+        assert fake_ydl.last_download is True
+        assert "1080" in fake_ydl.last_options["format"]
+        assert source.has_media

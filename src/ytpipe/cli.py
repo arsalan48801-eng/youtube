@@ -62,6 +62,9 @@ def run(
     transition: str = typer.Option("dip", help="cut | dip | xfade"),
     captions: bool = typer.Option(True, help="Burn captions into the picture"),
     scale: float = typer.Option(1.0, "--scale", help="0.5 = half-res draft pass, ~4x faster"),
+    transcript_only: bool = typer.Option(
+        False, "--transcript-only", help="Read the link: metadata + captions, no media download"
+    ),
     offline: bool = typer.Option(False, help="No network: deterministic writers and cards"),
     publish: bool = typer.Option(False, help="Actually upload (needs OAuth + YTPIPE_YOUTUBE_DRY_RUN=0)"),
     privacy: str = typer.Option("private", help="private | unlisted | public"),
@@ -82,6 +85,7 @@ def run(
         target_seconds=target,
         wpm=wpm,
         language=language,
+        transcript_only=transcript_only,
         music_path=music,
         transition=transition,
         captions=captions,
@@ -206,6 +210,73 @@ def demo(
 def _clock(seconds: float) -> str:
     ms = int(round(max(0.0, float(seconds)) * 1000))
     return f"{ms // 3_600_000:02d}:{ms // 60_000 % 60:02d}:{ms // 1000 % 60:02d}.{ms % 1000:03d}"
+
+
+@app.command()
+def transcript(
+    source: str = typer.Argument(..., help="YouTube URL, 11-char video id, or a local media file"),
+    language: str | None = typer.Option(None, help="Caption language, e.g. en, es, pt-BR"),
+    srt: Path | None = typer.Option(None, help="Also write an .srt file here"),
+    raw: bool = typer.Option(False, help="Print one line per caption cue instead of per sentence"),
+    json_out: Path | None = typer.Option(None, "--json", help="Also write the timed segments as JSON"),
+    workdir: Path | None = typer.Option(None, help="Where job folders live"),
+) -> None:
+    """Read a video's transcript straight from the link, with no media download.
+
+    Metadata plus the caption track is all this needs: tens of kilobytes, and it never
+    touches the streaming URLs -- the part that usually gets bot-checked. Run it before
+    committing to a render to answer "is there anything here to work with?".
+    """
+    import json as _json
+
+    from rich.console import Console
+
+    pipe = _pipeline(workdir, False, False)
+    job = pipe.run(
+        JobRequest(
+            source=source,
+            offline=False,
+            transcript_only=True,
+            language=language,
+            only=[StageName.FETCH, StageName.TRANSCRIBE],
+        )
+    )
+    console = Console()
+    if job.status is not Status.DONE:
+        console.print(f"[red]error[/red]  {job.error or 'transcript failed'}")
+        raise typer.Exit(1)
+
+    track = pipe.load_artifact(job, StageName.TRANSCRIBE)
+    if track is None or not track.segments:
+        console.print("[yellow]no caption track on this video[/yellow] -- nothing to read")
+        raise typer.Exit(2)
+
+    last = track.segments[-1].end
+    rows: list[tuple[float, str]] = []
+    if raw:
+        rows = [(seg.start, seg.text) for seg in track.segments]
+    else:
+        # An auto-caption track is one cue per *word*; printing that reads like a ransom
+        # note. Sentences are what a person wants to scan when deciding on a source.
+        from .stages.analyze import sentences_of
+
+        rows = [(start, text) for start, _end, text in sentences_of(track)]
+    console.print(
+        f"[bold]{len(track.segments)}[/bold] cues [dim]· {track.provider} · {track.language or '?'} · "
+        f"{len(rows)} lines · ends {int(last // 60):02d}:{last % 60:04.1f} · {job.id}[/dim]"
+    )
+    for start, text in rows:
+        console.print(f"[dim]{int(start // 60):02d}:{start % 60:04.1f}[/dim] {text}")
+    if srt:
+        from .captions import CaptionCue, to_srt
+
+        cues = [CaptionCue(start=s.start, end=s.end, text=s.text) for s in track.segments]
+        Path(srt).write_text(to_srt(cues), encoding="utf-8")
+        console.print(f"[green]wrote[/green] {srt}")
+    if json_out:
+        payload = [s.model_dump(mode="json") for s in track.segments]
+        Path(json_out).write_text(_json.dumps(payload, indent=2), encoding="utf-8")
+        console.print(f"[green]wrote[/green] {json_out}")
 
 
 @app.command("doctor")

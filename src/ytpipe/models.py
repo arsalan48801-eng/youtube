@@ -378,6 +378,9 @@ class JobRequest(_Model):
     only: list[StageName] | None = None
     until: StageName | None = None
     resume: bool = False
+    #: Read the link instead of downloading it: metadata + caption track only. The edit
+    #: then has no source footage to reuse, so visuals fall back to cards and stills.
+    transcript_only: bool = False
     #: Optional music bed, ducked under the voiceover at the final pass.
     music_path: Path | None = None
     music_gain_db: float = -18.0

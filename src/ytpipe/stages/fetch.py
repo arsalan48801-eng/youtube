@@ -132,30 +132,42 @@ class FetchStage:
     # -- youtube ---------------------------------------------------------------
 
     def _ydl_options(self, ctx: Any) -> dict[str, Any]:
-        return {
+        request = ctx.job.request
+        opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
             "ignoreerrors": False,
-            # Vertical-first: 1080p max keeps renders fast; the pipeline re-times
-            # captions itself so we only need the audio and picture, not 4K.
-            "format": (
-                "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/"
-                "best[ext=mp4][height<=1080]/bestvideo+bestaudio/best"
-            ),
-            "merge_output_format": "mp4",
             "outtmpl": str(ctx.dir / "source.%(ext)s"),
             "writesubtitles": True,
             "writeautomaticsub": True,
-            "subtitleslangs": [ctx.job.request.language] if ctx.job.request.language else ["en.*", "en"],
+            "subtitleslangs": [request.language] if request.language else ["en.*", "en"],
             "subtitlesformat": "vtt/srt/best",
-            "writethumbnail": True,
-            "postprocessors": [{"key": "FFmpegThumbnailsConvertor", "format": "jpg"}],
             "retries": 3,
             "socket_timeout": 30,
             "cachedir": str(ctx.dir / ".ytdlp-cache"),
             "noprogress": True,
         }
+        if request.transcript_only:
+            # "Just read the link": one metadata page and one subtitle file, tens of KB,
+            # no media. It also avoids the streaming URLs, which is where bot-checks
+            # usually fail, so this mode works in more places than a real download.
+            opts["skip_download"] = True
+            return opts
+        # Vertical-first: 1080p max keeps renders fast; the pipeline re-times captions
+        # itself so we only need the audio and picture, not 4K.
+        opts.update(
+            {
+                "format": (
+                    "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/"
+                    "best[ext=mp4][height<=1080]/bestvideo+bestaudio/best"
+                ),
+                "merge_output_format": "mp4",
+                "writethumbnail": True,
+                "postprocessors": [{"key": "FFmpegThumbnailsConvertor", "format": "jpg"}],
+            }
+        )
+        return opts
 
     def _from_youtube(self, ctx: Any, url: str) -> SourceVideo:
         try:
@@ -163,10 +175,11 @@ class FetchStage:
         except ImportError as exc:  # pragma: no cover
             raise FetchError("yt-dlp is not installed; `pip install yt-dlp`") from exc
 
-        ctx.emit(f"fetching {url}")
+        only_text = bool(ctx.job.request.transcript_only)
+        ctx.emit(f"reading {url}" + (" (transcript only, no download)" if only_text else ""))
         try:
             with yt_dlp.YoutubeDL(self._ydl_options(ctx)) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(url, download=not only_text)
         except Exception as exc:
             raise FetchError(explain_failure(str(exc) or repr(exc))) from exc
         if not info:
@@ -177,13 +190,23 @@ class FetchStage:
                 raise FetchError("playlist was empty")
             info = entries[0]
 
-        media = self._find_media(ctx.dir, info)
-        if media is None:
+        media = None if only_text else self._find_media(ctx.dir, info)
+        if only_text:
+            poster = None
+        elif media is None:
             raise FetchError(f"download produced no playable file in {ctx.dir}")
 
-        duration = float(info.get("duration") or 0.0) or ctx.ffmpeg.duration(media)
-        poster = next(iter(sorted(ctx.dir.glob("source*.jpg"))), None)
+        duration = float(info.get("duration") or 0.0) or (
+            ctx.ffmpeg.duration(media) if media else 0.0
+        )
+        poster = None if only_text else next(iter(sorted(ctx.dir.glob("source*.jpg"))), None)
         subs = self._find_captions(ctx.dir)
+        if only_text and subs is None:
+            raise FetchError(
+                "this video has no caption track, so there is nothing to read without "
+                "downloading it; drop --transcript-only to fetch the audio for ASR, or "
+                "pass a local file with a sibling .vtt/.srt"
+            )
         if subs:
             ctx.emit(f"caption track: {subs.name}")
         else:
